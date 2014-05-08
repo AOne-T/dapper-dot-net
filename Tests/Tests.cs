@@ -13,6 +13,8 @@ using System.Dynamic;
 using System.ComponentModel;
 using Microsoft.CSharp.RuntimeBinder;
 using System.Data.Common;
+using System.Globalization;
+using System.Threading;
 #if POSTGRESQL
 using Npgsql;
 #endif
@@ -659,6 +661,7 @@ insert #users16726709 values ('Fred','Bloggs') insert #users16726709 values ('To
             ((int?)row.B)
                 .IsEqualTo(2);
         }
+
         public void TestEnumeration()
         {
             var en = connection.Query<int>("select 1 as one union all select 2 as one", buffered: false);
@@ -678,7 +681,7 @@ insert #users16726709 values ('Fred','Bloggs') insert #users16726709 values ('To
             while (i.MoveNext())
             { }
 
-            // should not exception, since enumertated
+            // should not exception, since enumerated
             en = connection.Query<int>("select 1 as one", buffered: false);
 
             gotException.IsTrue();
@@ -975,6 +978,19 @@ Order by p.Id";
             data.e.IsEqualTo(5);
 
 
+        }
+
+        
+        public void ExecuteReader()
+        {
+            var dt = new DataTable();
+            dt.Load(connection.ExecuteReader("select 3 as [three], 4 as [four]"));
+            dt.Columns.Count.IsEqualTo(2);
+            dt.Columns[0].ColumnName.IsEqualTo("three");
+            dt.Columns[1].ColumnName.IsEqualTo("four");
+            dt.Rows.Count.IsEqualTo(1);
+            ((int)dt.Rows[0][0]).IsEqualTo(3);
+            ((int)dt.Rows[0][1]).IsEqualTo(4);
         }
 
         private class TestFieldCaseAndPrivatesEntity
@@ -2635,6 +2651,35 @@ end");
             row.B.IsNull();
             row.C.Equals(0.0M);
             row.D.IsNull();
+        }
+
+        public void TestParameterInclusionNotSensitiveToCurrentCulture()
+        {
+            CultureInfo current = Thread.CurrentThread.CurrentCulture;
+            try
+            {
+                Thread.CurrentThread.CurrentCulture = new CultureInfo("tr-TR");
+
+                connection.Query<int>("select @pid", new { PId = 1 }).Single();
+            }
+            finally
+            {
+                Thread.CurrentThread.CurrentCulture = current;
+            }
+        }
+
+        public void TestProcedureWithTimeParameter()
+        {
+            var p = new DynamicParameters();
+            p.Add("a", TimeSpan.FromHours(10), dbType: DbType.Time);
+
+            connection.Execute(@"CREATE PROCEDURE #TestProcWithTimeParameter
+    @a TIME
+    AS 
+    BEGIN
+    SELECT @a
+    END");
+            connection.Query<TimeSpan>("#TestProcWithTimeParameter", p, commandType: CommandType.StoredProcedure).First().IsEqualTo(new TimeSpan(10, 0, 0));
         }
 
         class HasDoubleDecimal

@@ -23,6 +23,133 @@ using System.Diagnostics;
 namespace Dapper
 {
     /// <summary>
+    /// Represents the key aspects of a sql operation
+    /// </summary>
+    public  struct CommandDefinition
+    {
+        private readonly string commandText;
+        private readonly object parameters;
+        private readonly IDbTransaction transaction;
+        private readonly int? commandTimeout;
+        private readonly CommandType? commandType;
+        private readonly bool buffered;
+
+
+
+        /// <summary>
+        /// The command (sql or a stored-procedure name) to execute
+        /// </summary>
+        public string CommandText { get { return commandText; } }
+        /// <summary>
+        /// The parameters associated with the command
+        /// </summary>
+        public object Parameters { get { return parameters; } }
+        /// <summary>
+        /// The active transaction for the command
+        /// </summary>
+        public IDbTransaction Transaction { get { return transaction; } }
+        /// <summary>
+        /// The effective timeout for the command
+        /// </summary>
+        public int? CommandTimeout { get { return commandTimeout; } }
+        /// <summary>
+        /// The type of command that the command-text represents
+        /// </summary>
+        public CommandType? CommandType { get { return commandType; } }
+
+        /// <summary>
+        /// Should data be buffered before returning?
+        /// </summary>
+        public bool Buffered { get { return buffered; } }
+
+        /// <summary>
+        /// Initialize the command definition
+        /// </summary>
+#if CSHARP30
+        public CommandDefinition(string commandText, object parameters, IDbTransaction transaction, int? commandTimeout,
+            CommandType? commandType, bool buffered)
+#else
+        public CommandDefinition(string commandText, object parameters = null, IDbTransaction transaction = null, int? commandTimeout = null,
+            CommandType? commandType = null, bool buffered = true
+#if ASYNC
+            , CancellationToken cancellationToken = default(CancellationToken)
+#endif
+            )
+#endif
+        {
+            this.commandText = commandText;
+            this.parameters = parameters;
+            this.transaction = transaction;
+            this.commandTimeout = commandTimeout;
+            this.commandType = commandType;
+            this.buffered = buffered;
+#if ASYNC
+            this.cancellationToken = cancellationToken;
+#endif
+        }
+
+#if ASYNC
+        private readonly CancellationToken cancellationToken;
+        /// <summary>
+        /// For asynchronous operations, the cancellation-token
+        /// </summary>
+        public CancellationToken CancellationToken { get { return cancellationToken; } }
+#endif
+
+        internal IDbCommand SetupCommand(IDbConnection cnn, Action<IDbCommand, object> paramReader)
+        {
+            var cmd = cnn.CreateCommand();
+            var bindByName = GetBindByName(cmd.GetType());
+            if (bindByName != null) bindByName(cmd, true);
+            if (transaction != null)
+                cmd.Transaction = transaction;
+            cmd.CommandText = commandText;
+            if (commandTimeout.HasValue)
+                cmd.CommandTimeout = commandTimeout.Value;
+            if (commandType.HasValue)
+                cmd.CommandType = commandType.Value;
+            if (paramReader != null)
+            {
+                paramReader(cmd, parameters);
+            }
+            return cmd;
+        }
+
+        static SqlMapper.Link<Type, Action<IDbCommand, bool>> bindByNameCache;
+        static Action<IDbCommand, bool> GetBindByName(Type commandType)
+        {
+            if (commandType == null) return null; // GIGO
+            Action<IDbCommand, bool> action;
+            if (SqlMapper.Link<Type, Action<IDbCommand, bool>>.TryGet(bindByNameCache, commandType, out action))
+            {
+                return action;
+            }
+            var prop = commandType.GetProperty("BindByName", BindingFlags.Public | BindingFlags.Instance);
+            action = null;
+            ParameterInfo[] indexers;
+            MethodInfo setter;
+            if (prop != null && prop.CanWrite && prop.PropertyType == typeof(bool)
+                && ((indexers = prop.GetIndexParameters()) == null || indexers.Length == 0)
+                && (setter = prop.GetSetMethod()) != null
+                )
+            {
+                var method = new DynamicMethod(commandType.Name + "_BindByName", null, new Type[] { typeof(IDbCommand), typeof(bool) });
+                var il = method.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Castclass, commandType);
+                il.Emit(OpCodes.Ldarg_1);
+                il.EmitCall(OpCodes.Callvirt, setter, null);
+                il.Emit(OpCodes.Ret);
+                action = (Action<IDbCommand, bool>)method.CreateDelegate(typeof(Action<IDbCommand, bool>));
+            }
+            // cache it            
+            SqlMapper.Link<Type, Action<IDbCommand, bool>>.TryAdd(ref bindByNameCache, commandType, ref action);
+            return action;
+        }
+
+    }
+
+    /// <summary>
     /// Dapper, a light weight object mapper for ADO.NET
     /// </summary>
     static partial class SqlMapper
@@ -113,43 +240,12 @@ namespace Dapper
             ParameterInfo Parameter { get; }
         }
 
-        static Link<Type, Action<IDbCommand, bool>> bindByNameCache;
-        static Action<IDbCommand, bool> GetBindByName(Type commandType)
-        {
-            if (commandType == null) return null; // GIGO
-            Action<IDbCommand, bool> action;
-            if (Link<Type, Action<IDbCommand, bool>>.TryGet(bindByNameCache, commandType, out action))
-            {
-                return action;
-            }
-            var prop = commandType.GetProperty("BindByName", BindingFlags.Public | BindingFlags.Instance);
-            action = null;
-            ParameterInfo[] indexers;
-            MethodInfo setter;
-            if (prop != null && prop.CanWrite && prop.PropertyType == typeof(bool)
-                && ((indexers = prop.GetIndexParameters()) == null || indexers.Length == 0)
-                && (setter = prop.GetSetMethod()) != null
-                )
-            {
-                var method = new DynamicMethod(commandType.Name + "_BindByName", null, new Type[] { typeof(IDbCommand), typeof(bool) });
-                var il = method.GetILGenerator();
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Castclass, commandType);
-                il.Emit(OpCodes.Ldarg_1);
-                il.EmitCall(OpCodes.Callvirt, setter, null);
-                il.Emit(OpCodes.Ret);
-                action = (Action<IDbCommand, bool>)method.CreateDelegate(typeof(Action<IDbCommand, bool>));
-            }
-            // cache it            
-            Link<Type, Action<IDbCommand, bool>>.TryAdd(ref bindByNameCache, commandType, ref action);
-            return action;
-        }
         /// <summary>
         /// This is a micro-cache; suitable when the number of terms is controllable (a few hundred, for example),
         /// and strictly append-only; you cannot change existing values. All key matches are on **REFERENCE**
         /// equality. The type is fully thread-safe.
         /// </summary>
-        partial class Link<TKey, TValue> where TKey : class
+        internal partial class Link<TKey, TValue> where TKey : class
         {
             public static bool TryGet(Link<TKey, TValue> link, TKey key, out TValue value)
             {
@@ -610,6 +706,42 @@ namespace Dapper
         }
 
         /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        public static IDataReader ExecuteReader(this IDbConnection cnn, string sql, object param)
+        {
+            return ExecuteReader(cnn, sql, param, null, null, null);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        public static IDataReader ExecuteReader(this IDbConnection cnn, string sql, object param, IDbTransaction transaction)
+        {
+            return ExecuteReader(cnn, sql, param, transaction, null, null);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        public static IDataReader ExecuteReader(this IDbConnection cnn, string sql, object param, CommandType commandType)
+        {
+            return ExecuteReader(cnn, sql, param, null, null, commandType);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        public static IDataReader ExecuteReader(this IDbConnection cnn, string sql, object param, IDbTransaction transaction, CommandType commandType)
+        {
+            return ExecuteReader(cnn, sql, param, transaction, null, commandType);
+        }
+
+        /// <summary>
         /// Executes a query, returning the data typed as per T
         /// </summary>
         /// <returns>A sequence of data of the supplied type; if a basic type (int, string, etc) is queried then the data from the first column in assumed, otherwise an instance is
@@ -677,6 +809,8 @@ namespace Dapper
             return QueryMultiple(cnn, sql, param, transaction, null, commandType);
         }
 #endif
+
+
         /// <summary>
         /// Execute parameterized SQL  
         /// </summary>
@@ -689,14 +823,28 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
 #endif
 )
         {
-            IEnumerable multiExec = (object)param as IEnumerable;
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true);
+            return ExecuteImpl(cnn, ref command);
+        }
+        /// <summary>
+        /// Execute parameterized SQL  
+        /// </summary>
+        /// <returns>Number of rows affected</returns>
+        public static int Execute(this IDbConnection cnn, CommandDefinition command)
+        {
+            return ExecuteImpl(cnn, ref command);
+        }
+        private static int ExecuteImpl(this IDbConnection cnn, ref CommandDefinition command)
+        {
+            object param = command.Parameters;
+            IEnumerable multiExec = param as IEnumerable;
             Identity identity;
             CacheInfo info = null;
             if (multiExec != null && !(multiExec is string))
             {
                 bool isFirst = true;
                 int total = 0;
-                using (var cmd = SetupCommand(cnn, transaction, sql, null, null, commandTimeout, commandType))
+                using (var cmd = command.SetupCommand(cnn, null))
                 {
 
                     string masterSql = null;
@@ -706,7 +854,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
                         {
                             masterSql = cmd.CommandText;
                             isFirst = false;
-                            identity = new Identity(sql, cmd.CommandType, cnn, null, obj.GetType(), null);
+                            identity = new Identity(command.CommandText, cmd.CommandType, cnn, null, obj.GetType(), null);
                             info = GetCacheInfo(identity);
                         }
                         else
@@ -722,13 +870,58 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
             }
 
             // nice and simple
-            if ((object)param != null)
+            if (param != null)
             {
-                identity = new Identity(sql, commandType, cnn, null, (object)param == null ? null : ((object)param).GetType(), null);
+                identity = new Identity(command.CommandText, command.CommandType, cnn, null, param.GetType(), null);
                 info = GetCacheInfo(identity);
             }
-            return ExecuteCommand(cnn, transaction, sql, (object)param == null ? null : info.ParamReader, (object)param, commandTimeout, commandType);
+            return ExecuteCommand(cnn, ref command, param == null ? null : info.ParamReader);
         }
+
+        /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        /// <remarks>
+        /// This is typically used when the results of a query are not processed by Dapper, for example, used to fill a <see cref="DataTable"/>
+        /// or <see cref="DataSet"/>.
+        /// </remarks>
+        /// <example>
+        /// <code>
+        /// <![CDATA[
+        /// DataTable table = new DataTable("MyTable");
+        /// using (var reader = ExecuteReader(cnn, sql, param))
+        /// {
+        ///     table.Load(reader);
+        /// }
+        /// ]]>
+        /// </code>
+        /// </example>
+        public static IDataReader ExecuteReader(
+#if CSHARP30
+this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType
+#else
+this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null
+#endif
+)
+        {
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true);
+            return ExecuteReaderImpl(cnn, ref command);
+        }
+
+        /// <summary>
+        /// Execute parameterized SQL and return an <see cref="IDataReader"/>
+        /// </summary>
+        /// <returns>An <see cref="IDataReader"/> that can be used to iterate over the results of the SQL query.</returns>
+        /// <remarks>
+        /// This is typically used when the results of a query are not processed by Dapper, for example, used to fill a <see cref="DataTable"/>
+        /// or <see cref="DataSet"/>.
+        /// </remarks>
+        public static IDataReader ExecuteReader(this IDbConnection cnn, CommandDefinition command)
+        {
+            return ExecuteReaderImpl(cnn, ref command);
+        }
+
 #if !CSHARP30
         /// <summary>
         /// Return a list of dynamic objects, reader is closed after the call
@@ -794,9 +987,25 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
 #endif
 )
         {
-            var data = QueryInternal<T>(cnn, sql, param as object, transaction, commandTimeout, commandType);
-            return buffered ? data.ToList() : data;
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered);
+            var data = QueryImpl<T>(cnn, command);
+            return command.Buffered ? data.ToList() : data;
         }
+
+        /// <summary>
+        /// Executes a query, returning the data typed as per T
+        /// </summary>
+        /// <remarks>the dynamic param may seem a bit odd, but this works around a major usability issue in vs, if it is Object vs completion gets annoying. Eg type new [space] get new object</remarks>
+        /// <returns>A sequence of data of the supplied type; if a basic type (int, string, etc) is queried then the data from the first column in assumed, otherwise an instance is
+        /// created per row, and a direct column-name===member-name mapping is assumed (case insensitive).
+        /// </returns>
+        public static IEnumerable<T> Query<T>(this IDbConnection cnn, CommandDefinition command)
+        {
+            var data = QueryImpl<T>(cnn, command);
+            return command.Buffered ? data.ToList() : data;
+        }
+
+
 
         /// <summary>
         /// Execute a command that returns multiple result sets, and access each in turn
@@ -809,7 +1018,20 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
 #endif
 )
         {
-            Identity identity = new Identity(sql, commandType, cnn, typeof(GridReader), (object)param == null ? null : ((object)param).GetType(), null);
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true);
+            return QueryMultipleImpl(cnn, ref command);
+        }
+        /// <summary>
+        /// Execute a command that returns multiple result sets, and access each in turn
+        /// </summary>
+        public static GridReader QueryMultiple(this IDbConnection cnn, CommandDefinition command)
+        {
+            return QueryMultipleImpl(cnn, ref command);
+        }
+        private static GridReader QueryMultipleImpl(this IDbConnection cnn, ref CommandDefinition command)
+        {
+            object param = command.Parameters;
+            Identity identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(GridReader), param == null ? null : param.GetType(), null);
             CacheInfo info = GetCacheInfo(identity);
 
             IDbCommand cmd = null;
@@ -818,7 +1040,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
             try
             {
                 if (wasClosed) cnn.Open();
-                cmd = SetupCommand(cnn, transaction, sql, info.ParamReader, (object)param, commandTimeout, commandType);
+                cmd = command.SetupCommand(cnn, info.ParamReader);
                 reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
 
                 var result = new GridReader(cmd, reader, identity);
@@ -842,12 +1064,10 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
             }
         }
 
-        /// <summary>
-        /// Return a typed list of objects, reader is closed after the call
-        /// </summary>
-        private static IEnumerable<T> QueryInternal<T>(this IDbConnection cnn, string sql, object param, IDbTransaction transaction, int? commandTimeout, CommandType? commandType)
+        private static IEnumerable<T> QueryImpl<T>(this IDbConnection cnn, CommandDefinition command)
         {
-            var identity = new Identity(sql, commandType, cnn, typeof(T), param == null ? null : param.GetType(), null);
+            object param = command.Parameters;
+            var identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(T), param == null ? null : param.GetType(), null);
             var info = GetCacheInfo(identity);
 
             IDbCommand cmd = null;
@@ -856,7 +1076,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
             bool wasClosed = cnn.State == ConnectionState.Closed;
             try
             {
-                cmd = SetupCommand(cnn, transaction, sql, info.ParamReader, param, commandTimeout, commandType);
+                cmd = command.SetupCommand(cnn, info.ParamReader);
 
                 if (wasClosed) cnn.Open();
                 reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
@@ -1063,16 +1283,18 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 #endif
         partial class DontMap { }
         static IEnumerable<TReturn> MultiMap<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(
-            this IDbConnection cnn, string sql, object map, object param, IDbTransaction transaction, bool buffered, string splitOn, int? commandTimeout, CommandType? commandType)
+            this IDbConnection cnn, string sql, Delegate map, object param, IDbTransaction transaction, bool buffered, string splitOn, int? commandTimeout, CommandType? commandType)
         {
-            var results = MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(cnn, sql, map, param, transaction, splitOn, commandTimeout, commandType, null, null);
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered);
+            var results = MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(cnn, command, map, splitOn, null, null);
             return buffered ? results.ToList() : results;
         }
 
 
-        static IEnumerable<TReturn> MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, string sql, object map, object param, IDbTransaction transaction, string splitOn, int? commandTimeout, CommandType? commandType, IDataReader reader, Identity identity)
+        static IEnumerable<TReturn> MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, CommandDefinition command, Delegate map, string splitOn, IDataReader reader, Identity identity)
         {
-            identity = identity ?? new Identity(sql, commandType, cnn, typeof(TFirst), (object)param == null ? null : ((object)param).GetType(), new[] { typeof(TFirst), typeof(TSecond), typeof(TThird), typeof(TFourth), typeof(TFifth), typeof(TSixth), typeof(TSeventh) });
+            object param = command.Parameters;
+            identity = identity ?? new Identity(command.CommandText, command.CommandType, cnn, typeof(TFirst), param == null ? null : param.GetType(), new[] { typeof(TFirst), typeof(TSecond), typeof(TThird), typeof(TFourth), typeof(TFifth), typeof(TSixth), typeof(TSeventh) });
             CacheInfo cinfo = GetCacheInfo(identity);
 
             IDbCommand ownedCommand = null;
@@ -1083,7 +1305,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             {
                 if (reader == null)
                 {
-                    ownedCommand = SetupCommand(cnn, transaction, sql, cinfo.ParamReader, (object)param, commandTimeout, commandType);
+                    ownedCommand = command.SetupCommand(cnn, cinfo.ParamReader);
                     if (wasClosed) cnn.Open();
                     ownedReader = ownedCommand.ExecuteReader();
                     reader = ownedReader;
@@ -1502,7 +1724,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 return GetEnumerator();
             }
 
-        #region Implementation of ICollection<KeyValuePair<string,object>>
+#region Implementation of ICollection<KeyValuePair<string,object>>
 
             void ICollection<KeyValuePair<string, object>>.Add(KeyValuePair<string, object> item)
             {
@@ -1541,9 +1763,9 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 get { return false; }
             }
 
-            #endregion
+#endregion
 
-        #region Implementation of IDictionary<string,object>
+#region Implementation of IDictionary<string,object>
 
             bool IDictionary<string, object>.ContainsKey(string key)
             {
@@ -1612,7 +1834,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 get { return this.Select(kv => kv.Value).ToArray(); }
             }
 
-            #endregion
+#endregion
         }
 #endif
         private const string MultiMapSplitExceptionMessage = "When using the multi-mapping APIs ensure you set the splitOn param if you have keys other than Id";
@@ -1833,7 +2055,7 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
         private static IEnumerable<PropertyInfo> FilterParameters(IEnumerable<PropertyInfo> parameters, string sql)
         {
-            return parameters.Where(p => Regex.IsMatch(sql, @"[?@:]" + p.Name + "([^a-zA-Z0-9_]+|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline));
+            return parameters.Where(p => Regex.IsMatch(sql, @"[?@:]" + p.Name + "([^a-zA-Z0-9_]+|$)", RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.CultureInvariant));
         }
 
 
@@ -1924,15 +2146,6 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
 
             foreach (var prop in props)
             {
-                if (filterParams)
-                {
-                    if (identity.sql.IndexOf("@" + prop.Name, StringComparison.InvariantCultureIgnoreCase) < 0
-                        && identity.sql.IndexOf(":" + prop.Name, StringComparison.InvariantCultureIgnoreCase) < 0
-                        && identity.sql.IndexOf("?" + prop.Name, StringComparison.InvariantCultureIgnoreCase) < 0)
-                    { // can't see the parameter in the text (even in a comment, etc) - burn it with fire
-                        continue;
-                    }
-                }
                 if (typeof(ICustomQueryParameter).IsAssignableFrom(prop.PropertyType))
                 {
                     il.Emit(OpCodes.Ldloc_0); // stack is now [parameters] [typed-param]
@@ -2078,33 +2291,13 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
             return (Action<IDbCommand, object>)dm.CreateDelegate(typeof(Action<IDbCommand, object>));
         }
 
-        private static IDbCommand SetupCommand(IDbConnection cnn, IDbTransaction transaction, string sql, Action<IDbCommand, object> paramReader, object obj, int? commandTimeout, CommandType? commandType)
-        {
-            var cmd = cnn.CreateCommand();
-            var bindByName = GetBindByName(cmd.GetType());
-            if (bindByName != null) bindByName(cmd, true);
-            if (transaction != null)
-                cmd.Transaction = transaction;
-            cmd.CommandText = sql;
-            if (commandTimeout.HasValue)
-                cmd.CommandTimeout = commandTimeout.Value;
-            if (commandType.HasValue)
-                cmd.CommandType = commandType.Value;
-            if (paramReader != null)
-            {
-                paramReader(cmd, obj);
-            }
-            return cmd;
-        }
-
-
-        private static int ExecuteCommand(IDbConnection cnn, IDbTransaction transaction, string sql, Action<IDbCommand, object> paramReader, object obj, int? commandTimeout, CommandType? commandType)
+        private static int ExecuteCommand(IDbConnection cnn, ref CommandDefinition command, Action<IDbCommand, object> paramReader)
         {
             IDbCommand cmd = null;
             bool wasClosed = cnn.State == ConnectionState.Closed;
             try
             {
-                cmd = SetupCommand(cnn, transaction, sql, paramReader, obj, commandTimeout, commandType);
+                cmd = command.SetupCommand(cnn, paramReader);
                 if (wasClosed) cnn.Open();
                 return cmd.ExecuteNonQuery();
             }
@@ -2113,6 +2306,48 @@ this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TRetu
                 if (wasClosed) cnn.Close();
                 if (cmd != null) cmd.Dispose();
             }
+        }
+
+        private static IDataReader ExecuteReaderImpl(IDbConnection cnn, ref CommandDefinition command)
+        {
+            Action<IDbCommand, object> paramReader = GetParameterReader(cnn, ref command);
+
+            IDbCommand cmd = null;
+            bool wasClosed = cnn.State == ConnectionState.Closed;
+            try
+            {
+                cmd = command.SetupCommand(cnn, paramReader);
+                if (wasClosed) cnn.Open();
+                var reader = cmd.ExecuteReader(wasClosed ? CommandBehavior.CloseConnection : CommandBehavior.Default);
+                wasClosed = false;
+                return reader;
+            }
+            finally
+            {
+                if (wasClosed) cnn.Close();
+                if (cmd != null) cmd.Dispose();
+            }
+        }
+
+        private static Action<IDbCommand, object> GetParameterReader(IDbConnection cnn, ref CommandDefinition command)
+        {
+            object param = command.Parameters;
+            IEnumerable multiExec = (object)param as IEnumerable;
+            Identity identity;
+            CacheInfo info = null;
+            if (multiExec != null && !(multiExec is string))
+            {
+                throw new NotSupportedException("MultiExec is not supported by ExecuteReader");
+            }
+
+            // nice and simple
+            if (param != null)
+            {
+                identity = new Identity(command.CommandText, command.CommandType, cnn, null, param.GetType(), null);
+                info = GetCacheInfo(identity);
+            }
+            var paramReader = info == null ? null : info.ParamReader;
+            return paramReader;
         }
 
         private static Func<IDataReader, object> GetStructDeserializer(Type type, Type effectiveType, int index)
@@ -2265,28 +2500,20 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                     types[i - startBound] = reader.GetFieldType(i);
                 }
 
-                if (type.IsValueType)
+                var ctor = typeMap.FindConstructor(names, types);
+                if (ctor == null)
                 {
-                    il.Emit(OpCodes.Ldloca_S, (byte)1);
-                    il.Emit(OpCodes.Initobj, type);
+                    string proposedTypes = "(" + String.Join(", ", types.Select((t, i) => t.FullName + " " + names[i]).ToArray()) + ")";
+                    throw new InvalidOperationException(String.Format("A parameterless default constructor or one matching signature {0} is required for {1} materialization", proposedTypes, type.FullName));
+                }
+
+                if (ctor.GetParameters().Length == 0)
+                {
+                    il.Emit(OpCodes.Newobj, ctor);
+                    il.Emit(OpCodes.Stloc_1);
                 }
                 else
-                {
-                    var ctor = typeMap.FindConstructor(names, types);
-                    if (ctor == null)
-                    {
-                        string proposedTypes = "(" + String.Join(", ", types.Select((t, i) => t.FullName + " " + names[i]).ToArray()) + ")";
-                        throw new InvalidOperationException(String.Format("A parameterless default constructor or one matching signature {0} is required for {1} materialization", proposedTypes, type.FullName));
-                    }
-
-                    if (ctor.GetParameters().Length == 0)
-                    {
-                        il.Emit(OpCodes.Newobj, ctor);
-                        il.Emit(OpCodes.Stloc_1);
-                    }
-                    else
-                        specializedConstructor = ctor;
-                }
+                    specializedConstructor = ctor;
             }
 
             il.BeginExceptionBlock();
@@ -2639,14 +2866,21 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 if (reader != null && index >= 0 && index < reader.FieldCount)
                 {
                     name = reader.GetName(index);
-                    object val = reader.GetValue(index);
-                    if (val == null || val is DBNull)
+                    try
                     {
-                        value = "<null>";
+                        object val = reader.GetValue(index); // if there throw an exception, then I got one message, but Which column?
+                        if (val == null || val is DBNull)
+                        {
+                            value = "<null>";
+                        }
+                        else
+                        {
+                            value = Convert.ToString(val) + " - " + Type.GetTypeCode(val.GetType());
+                        }
                     }
-                    else
+                    catch (Exception valEx)
                     {
-                        value = Convert.ToString(val) + " - " + Type.GetTypeCode(val.GetType());
+                        value = valEx.Message;
                     }
                 }
                 toThrow = new DataException(string.Format("Error parsing column {0} ({1}={2})", index, name, value), ex);
@@ -2760,7 +2994,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 return buffered ? result.ToList() : result;
             }
 
-            private IEnumerable<TReturn> MultiReadInternal<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(object func, string splitOn)
+            private IEnumerable<TReturn> MultiReadInternal<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(Delegate func, string splitOn)
             {
                 var identity = this.identity.ForGrid(typeof(TReturn), new Type[] { 
                     typeof(TFirst), 
@@ -2773,7 +3007,7 @@ Type type, IDataReader reader, int startBound = 0, int length = -1, bool returnN
                 }, gridIndex);
                 try
                 {
-                    foreach (var r in SqlMapper.MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(null, null, func, null, null, splitOn, null, null, reader, identity))
+                    foreach (var r in SqlMapper.MultiMapImpl<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(null, default(CommandDefinition), func, splitOn, reader, identity))
                     {
                         yield return r;
                     }
@@ -3112,14 +3346,19 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                 var dbType = param.DbType;
                 var val = param.Value;
                 string name = Clean(param.Name);
+                var isCustomQueryParameter = val is SqlMapper.ICustomQueryParameter;
 
-                if (dbType == null && val != null) dbType = SqlMapper.LookupDbType(val.GetType(), name);
+                if (dbType == null && val != null && !isCustomQueryParameter) dbType = SqlMapper.LookupDbType(val.GetType(), name);
 
                 if (dbType == DynamicParameters.EnumerableMultiParameter)
                 {
 #pragma warning disable 612, 618
                     SqlMapper.PackListParameters(command, name, val);
 #pragma warning restore 612, 618
+                }
+                else if (isCustomQueryParameter)
+                {
+                    ((SqlMapper.ICustomQueryParameter)val).AddParameter(command, name);
                 }
                 else
                 {
@@ -3150,7 +3389,7 @@ string name, object value = null, DbType? dbType = null, ParameterDirection? dir
                     {
                         p.Size = param.Size.Value;
                     }
-                    if (dbType != null)
+                    if (dbType != null && p.DbType != dbType)
                     {
                         p.DbType = dbType.Value;
                     }
