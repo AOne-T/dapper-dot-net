@@ -598,7 +598,7 @@ insert #users16726709 values ('Fred','Bloggs') insert #users16726709 values ('To
             connection.Execute("create table #t(Name nvarchar(max), Age int)");
             try
             {
-                int tally = connection.Execute(@"insert #t (Name,Age) values(@Name, @Age)", new List<Student> 
+                int tally = connection.Execute(@"insert #t (Name,Age) values(@Name, @Age)", new List<Student>
             {
                 new Student{Age = 1, Name = "sam"},
                 new Student{Age = 2, Name = "bob"}
@@ -980,7 +980,7 @@ Order by p.Id";
 
         }
 
-        
+
         public void ExecuteReader()
         {
             var dt = new DataTable();
@@ -1208,14 +1208,14 @@ end");
         {
             var obj = connection.Query("select datalength(@a) as a, datalength(@b) as b, datalength(@c) as c, datalength(@d) as d, datalength(@e) as e, datalength(@f) as f",
                 new
-                {
-                    a = new DbString { Value = "abcde", IsFixedLength = true, Length = 10, IsAnsi = true },
-                    b = new DbString { Value = "abcde", IsFixedLength = true, Length = 10, IsAnsi = false },
-                    c = new DbString { Value = "abcde", IsFixedLength = false, Length = 10, IsAnsi = true },
-                    d = new DbString { Value = "abcde", IsFixedLength = false, Length = 10, IsAnsi = false },
-                    e = new DbString { Value = "abcde", IsAnsi = true },
-                    f = new DbString { Value = "abcde", IsAnsi = false },
-                }).First();
+            {
+                a = new DbString { Value = "abcde", IsFixedLength = true, Length = 10, IsAnsi = true },
+                b = new DbString { Value = "abcde", IsFixedLength = true, Length = 10, IsAnsi = false },
+                c = new DbString { Value = "abcde", IsFixedLength = false, Length = 10, IsAnsi = true },
+                d = new DbString { Value = "abcde", IsFixedLength = false, Length = 10, IsAnsi = false },
+                e = new DbString { Value = "abcde", IsAnsi = true },
+                f = new DbString { Value = "abcde", IsAnsi = false },
+            }).First();
             ((int)obj.a).IsEqualTo(10);
             ((int)obj.b).IsEqualTo(20);
             ((int)obj.c).IsEqualTo(5);
@@ -1518,15 +1518,15 @@ end");
             var lookup = new Dictionary<int, Parent>();
             var parents = connection.Query<Parent, Child, Parent>(@"select 1 as [Id], 1 as [Id] union all select 1,2 union all select 2,3 union all select 1,4 union all select 3,5",
                 (parent, child) =>
+            {
+                Parent found;
+                if (!lookup.TryGetValue(parent.Id, out found))
                 {
-                    Parent found;
-                    if (!lookup.TryGetValue(parent.Id, out found))
-                    {
-                        lookup.Add(parent.Id, found = parent);
-                    }
-                    found.Children.Add(child);
-                    return found;
-                }).Distinct().ToDictionary(p => p.Id);
+                    lookup.Add(parent.Id, found = parent);
+                }
+                found.Children.Add(child);
+                return found;
+            }).Distinct().ToDictionary(p => p.Id);
             parents.Count().IsEqualTo(3);
             parents[1].Children.Select(c => c.Id).SequenceEqual(new[] { 1, 2, 4 }).IsTrue();
             parents[2].Children.Select(c => c.Id).SequenceEqual(new[] { 3 }).IsTrue();
@@ -1696,6 +1696,7 @@ Order by p.Id";
             {
                 foreach (IDbDataParameter parameter in parameters)
                     command.Parameters.Add(parameter);
+
             }
         }
         public void TestCustomParameters()
@@ -2449,9 +2450,9 @@ end");
             var results = connection.Query<dynamic, int, dynamic>(
                 "SELECT 1 Id, 'Mr' Title, 'John' Surname, 4 AddressCount",
                 (person, addressCount) =>
-                {
-                    return person;
-                },
+            {
+                return person;
+            },
                 splitOn: "AddressCount"
             ).FirstOrDefault();
 
@@ -2667,6 +2668,112 @@ end");
                 Thread.CurrentThread.CurrentCulture = current;
             }
         }
+        public void LiteralReplacement()
+        {
+            connection.Execute("create table #literal1 (id int not null, foo int not null)");
+            connection.Execute("insert #literal1 (id,foo) values ({=id}, @foo)", new { id = 123, foo = 456 });
+            var rows = new[] { new { id = 1, foo = 2 }, new { id = 3, foo = 4 } };
+            connection.Execute("insert #literal1 (id,foo) values ({=id}, @foo)", rows);
+            var count = connection.Query<int>("select count(1) from #literal1 where id={=foo}", new { foo = 123 }).Single();
+            count.IsEqualTo(1);
+            int sum = connection.Query<int>("select sum(id) + sum(foo) from #literal1").Single();
+            sum.IsEqualTo(123 + 456 + 1 + 2 + 3 + 4);
+        }
+        public void LiteralReplacementDynamic()
+        {
+            var args = new DynamicParameters();
+            args.Add("id", 123);
+            connection.Execute("create table #literal2 (id int not null)");
+            connection.Execute("insert #literal2 (id) values ({=id})", args);
+
+            args = new DynamicParameters();
+            args.Add("foo", 123);
+            var count = connection.Query<int>("select count(1) from #literal2 where id={=foo}", args).Single();
+            count.IsEqualTo(1);
+        }
+
+        enum AnEnum
+        {
+            A = 2,
+            B = 1
+        }
+        enum AnotherEnum : byte
+        {
+            A = 2,
+            B = 1
+        }
+        public void LiteralReplacementEnumAndString()
+        {
+            var args = new { x = AnEnum.B, y = 123.45M, z = AnotherEnum.A };
+            var row = connection.Query("select {=x} as x,{=y} as y,cast({=z} as tinyint) as z", args).Single();
+            AnEnum x = (AnEnum)(int)row.x;
+            decimal y = row.y;
+            AnotherEnum z = (AnotherEnum)(byte)row.z;
+            x.Equals(AnEnum.B);
+            y.Equals(123.45M);
+            z.Equals(AnotherEnum.A);
+        }
+        public void LiteralReplacementDynamicEnumAndString()
+        {
+            var args = new DynamicParameters();
+            args.Add("x", AnEnum.B);
+            args.Add("y", 123.45M);
+            args.Add("z", AnotherEnum.A);
+            var row = connection.Query("select {=x} as x,{=y} as y,cast({=z} as tinyint) as z", args).Single();
+            AnEnum x = (AnEnum)(int)row.x;
+            decimal y = row.y;
+            AnotherEnum z = (AnotherEnum)(byte)row.z;
+            x.Equals(AnEnum.B);
+            y.Equals(123.45M);
+            z.Equals(AnotherEnum.A);
+        }
+
+        public void LiteralReplacementWithIn()
+        {
+            var data = connection.Query<MyRow>("select @x where 1 in @ids and 1 ={=a}",
+                new { x = 1, ids = new[] { 1, 2, 3 }, a = 1 }).ToList();
+        }
+
+        class MyRow
+        {
+            public int x { get; set; }
+        }
+
+        public void LiteralIn()
+        {
+            connection.Execute("create table #literalin(id int not null);");
+            connection.Execute("insert #literalin (id) values (@id)", new[] {
+                new { id = 1 },
+                new { id = 2 },
+                new { id = 3 },
+            });
+            var count = connection.Query<int>("select count(1) from #literalin where id in {=ids}",
+                new { ids = new[] { 1, 3, 4 } }).Single();
+            count.IsEqualTo(2);
+        }
+
+        public void ParameterizedInWithOptimizeHint()
+        {
+            const string sql = @"
+select count(1)
+from(
+    select 1 as x
+    union all select 2
+    union all select 5) y
+where y.x in @vals
+option (optimize for (@vals unKnoWn))";
+            int count = connection.Query<int>(sql, new { vals = new[] { 1, 2, 3, 4 } }).Single();
+            count.IsEqualTo(2);
+
+            count = connection.Query<int>(sql, new { vals = new[] { 1 } }).Single();
+            count.IsEqualTo(1);
+
+            count = connection.Query<int>(sql, new { vals = new int[0] }).Single();
+            count.IsEqualTo(0);
+        }
+
+
+
 
         public void TestProcedureWithTimeParameter()
         {
@@ -2680,6 +2787,31 @@ end");
     SELECT @a
     END");
             connection.Query<TimeSpan>("#TestProcWithTimeParameter", p, commandType: CommandType.StoredProcedure).First().IsEqualTo(new TimeSpan(10, 0, 0));
+        }
+
+        public void DbString()
+        {
+            var a = connection.Query<int>("select datalength(@x)",
+                new { x = new DbString { Value = "abc", IsAnsi = true } }).Single();
+            var b = connection.Query<int>("select datalength(@x)",
+                new { x = new DbString { Value = "abc", IsAnsi = false } }).Single();
+            a.IsEqualTo(3);
+            b.IsEqualTo(6);
+        }
+
+        class HasInt32
+        {
+            public int Value { get; set; }
+        }
+        // http://stackoverflow.com/q/23696254/23354
+        public void DownwardIntegerConversion()
+        {
+            const string sql = "select cast(42 as bigint) as Value";
+            int i = connection.Query<HasInt32>(sql).Single().Value;
+            Assert.IsEqualTo(42, i);
+
+            i = connection.Query<int>(sql).Single();
+            Assert.IsEqualTo(42, i);
         }
 
         class HasDoubleDecimal

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
@@ -17,7 +18,7 @@ namespace Dapper
         /// </summary>
         public static Task<IEnumerable<T>> QueryAsync<T>(this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null)
         {
-            return QueryAsync<T>(cnn, new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true, default(CancellationToken)));
+            return QueryAsync<T>(cnn, new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered, default(CancellationToken)));
         }
 
         /// <summary>
@@ -27,7 +28,7 @@ namespace Dapper
         {
             object param = command.Parameters;
             var identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(T), param == null ? null : param.GetType(), null);
-            var info = GetCacheInfo(identity);
+            var info = GetCacheInfo(identity, param);
             bool wasClosed = cnn.State == ConnectionState.Closed;
             using (var cmd = (DbCommand)command.SetupCommand(cnn, info.ParamReader))
             {
@@ -51,17 +52,132 @@ namespace Dapper
         /// </summary>
         public static Task<int> ExecuteAsync(this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null)
         {
-            return ExecuteAsync(cnn, new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true, default(CancellationToken)));
+            return ExecuteAsync(cnn, new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered, default(CancellationToken)));
         }
 
         /// <summary>
         /// Execute a command asynchronously using .NET 4.5 Task.
         /// </summary>
-        public static async Task<int> ExecuteAsync(this IDbConnection cnn, CommandDefinition command)
+        public static Task<int> ExecuteAsync(this IDbConnection cnn, CommandDefinition command)
         {
             object param = command.Parameters;
+            IEnumerable multiExec = param as IEnumerable;
+            if (multiExec != null && !(param is string))
+            {
+                return ExecuteMultiImplAsync(cnn, command, multiExec);
+            }
+            else
+            {
+                return ExecuteImplAsync(cnn, command, param);
+            }
+        }
+       
+        private struct AsyncExecState
+        {
+            public readonly DbCommand Command;
+            public readonly Task<int> Task;
+            public AsyncExecState(DbCommand command, Task<int> task)
+            {
+                this.Command = command;
+                this.Task = task;
+            }
+        }
+        private static async Task<int> ExecuteMultiImplAsync(IDbConnection cnn, CommandDefinition command, IEnumerable multiExec)
+        {
+            bool isFirst = true;
+            int total = 0;
+            bool wasClosed = cnn.State == ConnectionState.Closed;
+            try
+            {
+                if (wasClosed) await ((DbConnection)cnn).OpenAsync().ConfigureAwait(false);
+                
+                CacheInfo info = null;
+                string masterSql = null;
+                if ((command.Flags & CommandFlags.Pipelined) != 0)
+                {
+                    const int MAX_PENDING = 100;
+                    var pending = new Queue<AsyncExecState>(MAX_PENDING);
+                    DbCommand cmd = null;
+                    try
+                    {
+                        foreach (var obj in multiExec)
+                        {
+                            if (isFirst)
+                            {
+                                isFirst = false;
+                                cmd = (DbCommand)command.SetupCommand(cnn, null);
+                                masterSql = cmd.CommandText;
+                                var identity = new Identity(command.CommandText, cmd.CommandType, cnn, null, obj.GetType(), null);
+                                info = GetCacheInfo(identity, obj);
+                            } else if(pending.Count >= MAX_PENDING)
+                            {
+                                var recycled = pending.Dequeue();
+                                total += await recycled.Task.ConfigureAwait(false);
+                                cmd = recycled.Command;
+                                cmd.CommandText = masterSql; // because we do magic replaces on "in" etc
+                                cmd.Parameters.Clear(); // current code is Add-tastic
+                            }
+                            else
+                            {
+                                cmd = (DbCommand)command.SetupCommand(cnn, null);
+                            }
+                            info.ParamReader(cmd, obj);
+
+                            var task = cmd.ExecuteNonQueryAsync(command.CancellationToken);
+                            pending.Enqueue(new AsyncExecState(cmd, task));
+                            cmd = null; // note the using in the finally: this avoids a double-dispose
+                        }
+                        while (pending.Count != 0)
+                        {
+                            var pair = pending.Dequeue();
+                            using (pair.Command) { } // dispose commands
+                            total += await pair.Task.ConfigureAwait(false);
+                        }
+                    } finally
+                    {
+                        // this only has interesting work to do if there are failures
+                        using (cmd) { } // dispose commands
+                        while (pending.Count != 0)
+                        { // dispose tasks even in failure
+                            using (pending.Dequeue().Command) { } // dispose commands
+                        }
+                    }
+                    return total;
+                }
+                else
+                {
+                    using (var cmd = (DbCommand)command.SetupCommand(cnn, null))
+                    {
+                        foreach (var obj in multiExec)
+                        {
+                            if (isFirst)
+                            {
+                                masterSql = cmd.CommandText;
+                                isFirst = false;
+                                var identity = new Identity(command.CommandText, cmd.CommandType, cnn, null, obj.GetType(), null);
+                                info = GetCacheInfo(identity, obj);
+                            }
+                            else
+                            {
+                                cmd.CommandText = masterSql; // because we do magic replaces on "in" etc
+                                cmd.Parameters.Clear(); // current code is Add-tastic
+                            }
+                            info.ParamReader(cmd, obj);
+                            total += await cmd.ExecuteNonQueryAsync(command.CancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (wasClosed) cnn.Close();
+            }
+            return total;
+        }
+        private static async Task<int> ExecuteImplAsync(IDbConnection cnn, CommandDefinition command, object param)
+        {
             var identity = new Identity(command.CommandText, command.CommandType, cnn, null, param == null ? null : param.GetType(), null);
-            var info = GetCacheInfo(identity);
+            var info = GetCacheInfo(identity, param);
             bool wasClosed = cnn.State == ConnectionState.Closed;
             using (var cmd = (DbCommand)command.SetupCommand(cnn, info.ParamReader))
             {
@@ -96,7 +212,7 @@ namespace Dapper
         public static Task<IEnumerable<TReturn>> QueryAsync<TFirst, TSecond, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMapAsync<TFirst, TSecond, DontMap, DontMap, DontMap, DontMap, DontMap, TReturn>(cnn,
-                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered, default(CancellationToken)), map, splitOn);
+                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None, default(CancellationToken)), map, splitOn);
         }
 
         /// <summary>
@@ -135,7 +251,7 @@ namespace Dapper
         public static Task<IEnumerable<TReturn>> QueryAsync<TFirst, TSecond, TThird, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMapAsync<TFirst, TSecond, TThird, DontMap, DontMap, DontMap, DontMap, TReturn>(cnn,
-                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered, default(CancellationToken)), map, splitOn);
+                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None, default(CancellationToken)), map, splitOn);
         }
 
         /// <summary>
@@ -176,7 +292,7 @@ namespace Dapper
         public static Task<IEnumerable<TReturn>> QueryAsync<TFirst, TSecond, TThird, TFourth, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMapAsync<TFirst, TSecond, TThird, TFourth, DontMap, DontMap, DontMap, TReturn>(cnn,
-                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered, default(CancellationToken)), map, splitOn);
+                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None, default(CancellationToken)), map, splitOn);
         }
 
         /// <summary>
@@ -203,7 +319,7 @@ namespace Dapper
         public static Task<IEnumerable<TReturn>> QueryAsync<TFirst, TSecond, TThird, TFourth, TFifth, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMapAsync<TFirst, TSecond, TThird, TFourth, TFifth, DontMap, DontMap, TReturn>(cnn,
-                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered, default(CancellationToken)), map, splitOn);
+                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None, default(CancellationToken)), map, splitOn);
         }
 
         /// <summary>
@@ -220,7 +336,7 @@ namespace Dapper
         public static Task<IEnumerable<TReturn>> QueryAsync<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMapAsync<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, DontMap, TReturn>(cnn,
-                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered, default(CancellationToken)), map, splitOn);
+                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None, default(CancellationToken)), map, splitOn);
         }
 
         /// <summary>
@@ -237,7 +353,7 @@ namespace Dapper
         public static Task<IEnumerable<TReturn>> QueryAsync<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(this IDbConnection cnn, string sql, Func<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn> map, dynamic param = null, IDbTransaction transaction = null, bool buffered = true, string splitOn = "Id", int? commandTimeout = null, CommandType? commandType = null)
         {
             return MultiMapAsync<TFirst, TSecond, TThird, TFourth, TFifth, TSixth, TSeventh, TReturn>(cnn,
-                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered, default(CancellationToken)), map, splitOn);
+                new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, buffered ? CommandFlags.Buffered : CommandFlags.None, default(CancellationToken)), map, splitOn);
         }
 
         /// <summary>
@@ -252,7 +368,7 @@ namespace Dapper
         {
             object param = command.Parameters;
             var identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(TFirst), param == null ? null : param.GetType(), new[] { typeof(TFirst), typeof(TSecond), typeof(TThird), typeof(TFourth), typeof(TFifth), typeof(TSixth), typeof(TSeventh) });
-            var info = GetCacheInfo(identity);
+            var info = GetCacheInfo(identity, param);
             bool wasClosed = cnn.State == ConnectionState.Closed;
             try
             {
@@ -298,7 +414,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
 #endif
 )
         {
-            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true);
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered);
             return QueryMultipleAsync(cnn, command);
         }
         /// <summary>
@@ -308,7 +424,7 @@ this IDbConnection cnn, string sql, object param, IDbTransaction transaction, in
         {
             object param = command.Parameters;
             Identity identity = new Identity(command.CommandText, command.CommandType, cnn, typeof(GridReader), param == null ? null : param.GetType(), null);
-            CacheInfo info = GetCacheInfo(identity);
+            CacheInfo info = GetCacheInfo(identity, param);
 
             DbCommand cmd = null;
             IDataReader reader = null;
@@ -371,7 +487,7 @@ this IDbConnection cnn, string sql, dynamic param = null, IDbTransaction transac
 #endif
 )
         {
-            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, true);
+            var command = new CommandDefinition(sql, (object)param, transaction, commandTimeout, commandType, CommandFlags.Buffered);
             return ExecuteReaderImplAsync(cnn, command);
         }
 
